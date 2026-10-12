@@ -1,0 +1,4 @@
+name: astrbot_plugin_jev_router
+version: 1.2.1
+author: Amadeus & 相合伞
+description: 基于 TypeSafe Jev 的多代理意图路由（放行式），支持自定义 API 地址、动态补全与原生全流程继承
