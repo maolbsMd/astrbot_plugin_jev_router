@@ -1,0 +1,86 @@
+{
+  "typesafe_api_key": {
+    "description": "TypeSafe (Jev) API Key",
+    "type": "string",
+    "hint": "在 api.typesafe.ai 获取，用于意图分类判定",
+    "default": ""
+  },
+  "api_url": {
+    "description": "API 请求地址",
+    "type": "string",
+    "hint": "默认官方接口 https://api.typesafe.ai/v1/systemone，若使用反代或转发网关可自行修改",
+    "default": "https://api.typesafe.ai/v1/systemone"
+  },
+  "jev_model": {
+    "description": "Jev 判定模型",
+    "type": "string",
+    "hint": "默认 jev-latest，或指定版本如 jev-1.13.0",
+    "default": "jev-latest"
+  },
+  "min_confidence": {
+    "description": "最低置信度",
+    "type": "float",
+    "hint": "0~1。Jev 判定置信度低于此值或请求失败时，本轮走默认主流程，不切换代理",
+    "default": 0.55
+  },
+  "share_context_with_jev": {
+    "description": "喂给 Jev 近期对话",
+    "type": "bool",
+    "hint": "开启后，Jev 判定时会附带上一轮对话摘要，提升「改一下」「继续」这类续聊的判定准确率",
+    "default": true
+  },
+  "agents": {
+    "description": "子代理定义列表",
+    "type": "template_list",
+    "hint": "添加并配置子代理。name=唯一标识 / desc=意图描述 / persona_id=选用人设 / provider_id=选用模型",
+    "default": [],
+    "templates": {
+      "agent": {
+        "name": "子代理",
+        "items": {
+          "name": {
+            "description": "代理唯一标识",
+            "type": "string",
+            "hint": "喂给 Jev 的选项名称，例如: coder, math_tutor, normal",
+            "default": ""
+          },
+          "desc": {
+            "description": "意图描述",
+            "type": "string",
+            "hint": "描述该代理负责的场景，用于给 Jev 判定，越互斥越准",
+            "default": ""
+          },
+          "persona_id": {
+            "description": "绑定人设",
+            "type": "string",
+            "_special": "select_persona",
+            "hint": "选择 AstrBot 已有人设（留空则沿用当前会话人设）",
+            "default": ""
+          },
+          "provider_id": {
+            "description": "绑定模型",
+            "type": "string",
+            "_special": "select_provider",
+            "hint": "选择调用的 Provider 模型（留空则沿用当前会话模型）",
+            "default": ""
+          },
+          "system_prompt": {
+            "description": "追加指令",
+            "type": "string",
+            "hint": "该子代理的专属系统指令（追加在人设与记忆之后生效）",
+            "default": ""
+          },
+          "tools": {
+            "description": "可用插件",
+            "type": "list",
+            "_special": "select_plugin_set",
+            "hint": "默认启用所有插件。若需限制，可点开切换为自定义勾选",
+            "default": [
+              "*"
+            ]
+          }
+        }
+      }
+    }
+  }
+}
