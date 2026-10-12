@@ -4,6 +4,7 @@ desc: 基于 TypeSafe Jev 的多代理意图路由（放行式），支持动态
 version: v1.2.2
 author: 牧奈 & maolbsMd
 repo: https://github.com/maolbsMd/astrbot_plugin_jev_router
+icon: icon.png
 support_platforms:
   - aiocqhttp
   - qq_official
