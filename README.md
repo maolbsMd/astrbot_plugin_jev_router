@@ -78,7 +78,7 @@ git clone https://github.com/maolbsMd/astrbot_plugin_jev_router.git
 
 ## 👥 作者
 
-Amadeus & 相合伞
+maolbsMd & 牧奈
 
 ## 📄 License
 
