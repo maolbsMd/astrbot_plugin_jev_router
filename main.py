@@ -1,7 +1,7 @@
 import aiohttp
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import register, Star, Context
-from astrbot.core import logger
+from astrbot.api import logger
 from astrbot.core.agent.message import Message
 
 # event extra keys，避免与其他插件冲突
