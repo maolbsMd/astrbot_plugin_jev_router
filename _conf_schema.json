@@ -29,6 +29,12 @@
     "hint": "开启后，Jev 判定时会附带上一轮对话摘要，提升「改一下」「继续」这类续聊的判定准确率",
     "default": true
   },
+  "history_rounds": {
+    "description": "喂给 Jev 的对话轮数",
+    "type": "int",
+    "hint": "判定时附带多少轮历史对话（1轮=用户+助手各一条），影响续聊类判定准确度与 token 消耗，建议 2~4",
+    "default": 2
+  },
   "agents": {
     "description": "子代理定义列表",
     "type": "template_list",
