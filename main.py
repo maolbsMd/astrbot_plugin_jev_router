@@ -38,6 +38,14 @@ class JevRouterPlugin(Star):
 
     # ---------- 配置解析 ----------
 
+    def _get_history_rounds(self) -> int:
+        """喂给 Jev 的近期对话轮数（1 轮 = 用户+助手各一条）"""
+        try:
+            n = int(self.config.get("history_rounds", 2))
+        except (TypeError, ValueError):
+            n = 2
+        return max(1, min(n, 10))
+
     def _get_agents(self) -> list[dict]:
         agents = self.config.get("agents", []) or []
         res = []
@@ -158,7 +166,8 @@ class JevRouterPlugin(Star):
                 cid = await self.context.conversation_manager.get_curr_conversation_id(umo)
                 conv = await self.context.conversation_manager.get_conversation(umo, cid)
                 if conv and conv.history:
-                    tail = [Message.model_validate(m) for m in conv.history[-4:]]
+                    n = self._get_history_rounds()
+                    tail = [Message.model_validate(m) for m in conv.history[-(n * 2):]]
                     lines = [f"{c.role}: {c.content[:80]}" for c in tail if getattr(c, "content", None)]
                     if lines:
                         parts.append("近期对话:\n" + "\n".join(lines))
