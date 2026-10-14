@@ -75,6 +75,7 @@ git clone https://github.com/maolbsMd/astrbot_plugin_jev_router.git
 - Jev 官方协议要求 `choice` 类型问题必须携带 `criteria` 字典映射，本插件已自动由 `name -> desc` 构建
 - 插件的 `on_llm_request` 钩子使用 `-100` 低优先级，确保在记忆插件注入**之后**再追加人设，互不覆盖
 - `_last_agent` 仅作为判定提示，不做会话粘性，每轮独立判定
+- 同一个模型人设prompt等保持一致，所以缓存命中率对每个模型并没有影响，但要避免短时间使用太多不同代理
 
 ## 👥 作者
 
