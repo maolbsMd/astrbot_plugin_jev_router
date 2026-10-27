@@ -1,10 +1,9 @@
 name: astrbot_plugin_jev_router
 display_name: jev智能模型选择
 desc: 基于 TypeSafe Jev 的多代理意图路由（放行式），支持动态切模型、人设追加与工具白名单，原生记忆与会话历史全程保活。
-version: v1.2.2
+version: 1.3.0
 author: 牧奈 & maolbsMd
 repo: https://github.com/maolbsMd/astrbot_plugin_jev_router
-icon: icon.png
 support_platforms:
   - aiocqhttp
   - qq_official
@@ -25,4 +24,4 @@ tags:
   - Jev
   - 意图识别
   - 多代理
-astrbot_version: ">=4.0.0"
+astrbot_version: ">=4.5.0"
