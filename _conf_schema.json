@@ -47,6 +47,12 @@
     "hint": "默认开启。以 / 开头的消息不送 Jev 判定，省一次计费调用并避免指令被超时拖慢",
     "default": true
   },
+  "only_wake_in_group": {
+    "description": "群聊仅判定需要回复的消息",
+    "type": "bool",
+    "hint": "默认开启：私聊全部判定；群聊只有 @bot、引用 bot 或带唤醒前缀的消息才判定。关闭后群聊每条消息都会判定（更费 token、也更容易误触发切模型）",
+    "default": true
+  },
   "history_rounds": {
     "description": "喂给 Jev 的对话轮数",
     "type": "int",
@@ -85,14 +91,14 @@
             "description": "绑定模型",
             "type": "string",
             "_special": "select_provider",
-            "hint": "选择调用的 Provider 模型（留空则沿用当前会话模型）",
+            "hint": "选择调用的 Provider 模型（留空则沿用当前会话模型）；调用失败会自动切到下面的兜底模型",
             "default": ""
           },
           "fallback_provider_ids": {
-            "description": "兜底模型",
+            "description": "兜底模型（调用失败后重试）",
             "type": "list",
             "_special": "select_providers",
-            "hint": "首选模型不存在或被删除时，按顺序尝试这些 Provider；都不可用则沿用当前会话模型",
+            "hint": "首选模型调用失败（429/超时/5xx）时按顺序重试这些 Provider；首选不存在/被删除时也会用它顶上；全部不可用则沿用当前会话模型",
             "default": []
           },
           "system_prompt": {

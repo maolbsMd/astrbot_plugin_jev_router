@@ -18,7 +18,8 @@ except Exception:  # pragma: no cover - 兼容未来版本
     star_map = None
 
 # event extra keys，避免与其他插件冲突
-_K_AGENT = "jev_router_agent_name"  # 本轮命中的代理名
+_K_AGENT = "jev_router_agent_name"    # 本轮命中的代理名
+_K_FAILOVER = "jev_router_failover"   # 已用兜底 provider 答复过（防止重复兜底）
 
 DEFAULT_JEV_URL = "https://api.typesafe.ai/v1/systemone"
 
@@ -33,7 +34,7 @@ _FAIL_COOLDOWN = 60.0         # 熔断秒数
 
 @register("astrbot_plugin_jev_router", "Amadeus & 相合伞",
           "基于 TypeSafe Jev 的意图路由（放行式）：仅覆写本轮模型/人设/工具，"
-          "主流程、会话历史与记忆注入归档全程与原生一致", "1.3.0")
+          "主流程、会话历史与记忆注入归档全程与原生一致", "1.4.0")
 class JevRouterPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
@@ -155,15 +156,19 @@ class JevRouterPlugin(Star):
             return raw + "/v1/systemone"
         return raw
 
-    def _resolve_provider_id(self, target: dict) -> str:
-        """解析本轮要用的 provider：首选不可用时按兜底列表依次尝试。
+    def _get_provider(self, provider_id: str):
+        try:
+            return self.context.get_provider_by_id(provider_id)
+        except Exception as e:
+            logger.debug(f"[JevRouter] provider 解析失败 {provider_id}: {e}")
+            return None
 
-        返回空字符串表示沿用当前会话模型（不设置 selected_provider）。
-        """
-        candidates: list[str] = []
+    def _provider_chain(self, target: dict) -> list[str]:
+        """返回 [首选, *兜底] 的 provider id 链（去重保序）。"""
+        chain: list[str] = []
         primary = str(target.get("provider_id") or "").strip()
         if primary:
-            candidates.append(primary)
+            chain.append(primary)
 
         raw_fallback = target.get("fallback_provider_ids") or []
         if isinstance(raw_fallback, str):
@@ -171,26 +176,52 @@ class JevRouterPlugin(Star):
         if isinstance(raw_fallback, list):
             for item in raw_fallback:
                 pid = str(item).strip()
-                if pid and pid not in candidates:
-                    candidates.append(pid)
+                if pid and pid not in chain:
+                    chain.append(pid)
+        return chain
 
-        for pid in candidates:
-            try:
-                if self.context.get_provider_by_id(pid):
-                    if primary and pid != primary:
-                        logger.info(
-                            f"[JevRouter] 首选 provider {primary} 不可用，回退到 {pid}"
-                        )
-                    return pid
-            except Exception as e:
-                logger.debug(f"[JevRouter] provider 解析失败 {pid}: {e}")
+    def _resolve_provider_id(self, target: dict) -> str:
+        """预检：首选 provider 不可用（不存在/被删除）时，按兜底列表依次尝试。
 
-        if candidates:
+        返回空字符串表示沿用当前会话模型（不设置 selected_provider）。
+        运行期失败（429/超时/5xx）由 on_llm_response 钩子兜底，不在这里处理。
+        """
+        chain = self._provider_chain(target)
+        for pid in chain:
+            if self._get_provider(pid):
+                if chain[0] and pid != chain[0]:
+                    logger.info(
+                        f"[JevRouter] 首选 provider {chain[0]} 不可用，回退到 {pid}"
+                    )
+                return pid
+
+        if chain:
             logger.warning(
                 "[JevRouter] 所有 provider 都不可用 (%s)，本轮沿用当前会话模型",
-                ", ".join(candidates),
+                ", ".join(chain),
             )
         return ""
+
+    def _current_agent(self, event: AstrMessageEvent) -> dict | None:
+        agent_name = event.get_extra(_K_AGENT)
+        if not agent_name:
+            return None
+        return next((a for a in self._get_agents() if a["name"] == agent_name), None)
+
+    def _should_route(self, event: AstrMessageEvent) -> bool:
+        """只判定真正需要 bot 回复的消息。
+
+        私聊：全部判定；群聊：只有 @bot / 引用 bot / 命中唤醒前缀的消息才判定。
+        """
+        try:
+            if event.is_private_chat():
+                return True
+            if not bool(self.config.get("only_wake_in_group", True)):
+                return True
+            return bool(getattr(event, "is_wake", False))
+        except Exception:
+            # 平台事件结构不认识时保守判定，避免漏答
+            return True
 
     def _resolve_persona_prompt(self, persona_id: str) -> str:
         """按 persona_id 取人设提示词，兼容新版 persona_manager 与旧版配置列表。"""
@@ -348,8 +379,12 @@ class JevRouterPlugin(Star):
         if not user_msg:
             return
 
-        # 指令消息不送判定：既省一次计费调用，也避免命令被 6 秒超时拖慢
+        # 指令消息不送判定：既省一次计费调用，也避免命令被超时拖慢
         if bool(self.config.get("skip_commands", True)) and user_msg.startswith("/"):
+            return
+
+        # 群聊里跟 bot 无关的消息不判定，只有 @/引用/唤醒前缀才判定
+        if not self._should_route(event):
             return
 
         if self._breaker_open():
@@ -464,3 +499,84 @@ class JevRouterPlugin(Star):
         logger.debug(
             f"[JevRouter] agent={agent_name} 工具白名单保留 {len(kept)}/{len(tools)}"
         )
+
+    # ---------- 第三阶段：首选 provider 调用失败后自动兜底 ----------
+
+    @filter.on_llm_response()
+    async def on_llm_response_failover(self, event: AstrMessageEvent, resp):
+        """AstrBot 原生只在全局配置里支持失败兜底；这里按代理粒度补上。
+
+        仅在「已路由到某个代理」且本轮首选出错（role == "err"）时触发，
+        按 fallback_provider_ids 顺序重试，成功则用兜底结果替换错误响应。
+        """
+        if getattr(resp, "role", "") != "err":
+            return
+        if event.get_extra(_K_FAILOVER):
+            return
+
+        target = self._current_agent(event)
+        if not target:
+            return
+        req = event.get_extra("provider_request")
+        if req is None:
+            return
+
+        current = (
+            event.get_extra("selected_provider")
+            or str(target.get("provider_id") or "").strip()
+        )
+        chain = [pid for pid in self._provider_chain(target) if pid != current]
+        if not chain:
+            return
+
+        for pid in chain:
+            provider = self._get_provider(pid)
+            if provider is None:
+                continue
+            try:
+                fb = await provider.text_chat(
+                    prompt=getattr(req, "prompt", None) or None,
+                    contexts=getattr(req, "contexts", None),
+                    system_prompt=getattr(req, "system_prompt", None) or None,
+                    session_id=getattr(req, "session_id", None),
+                    image_urls=getattr(req, "image_urls", None) or None,
+                    audio_urls=getattr(req, "audio_urls", None) or None,
+                    func_tool=None,
+                    request_max_retries=2,
+                )
+            except Exception as e:
+                logger.warning(f"[JevRouter] 兜底 provider {pid} 调用失败: {e}")
+                continue
+
+            text = (getattr(fb, "completion_text", "") or "").strip()
+            if getattr(fb, "role", "") == "err" or not text:
+                continue
+
+            # 用兜底结果替换原始错误响应；下游会据此生成最终回复
+            resp.role = "assistant"
+            resp.completion_text = text
+            resp.tools_call_args = []
+            resp.tools_call_name = []
+            resp.tools_call_ids = []
+            event.set_extra(_K_FAILOVER, text)
+            logger.info(
+                f"[JevRouter] provider {current or '沿用'} 调用失败，已切换兜底 {pid}"
+            )
+            return
+
+        logger.warning("[JevRouter] 首选与兜底 provider 均失败，保留原始错误")
+
+    @filter.on_agent_done()
+    async def on_agent_done_fix_history(self, event: AstrMessageEvent, run_context, llm_response):
+        """兜底成功后，把本轮写入历史的错误文本改回兜底文本。"""
+        text = event.get_extra(_K_FAILOVER)
+        if not text:
+            return
+        try:
+            messages = getattr(run_context, "messages", None)
+            if messages:
+                last = messages[-1]
+                if getattr(last, "role", "") == "assistant":
+                    last.content = text
+        except Exception as e:
+            logger.debug(f"[JevRouter] 修正对话历史失败: {e}")
