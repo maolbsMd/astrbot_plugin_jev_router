@@ -1,8 +1,11 @@
 import asyncio
+import base64
 import json
 import math
+import mimetypes
 import time
 from collections import OrderedDict
+from pathlib import Path
 
 import aiohttp
 
@@ -30,6 +33,9 @@ _MAX_STATE_CHARS = 6000       # 送给判定接口的 state 上限，防止超�
 _MAX_RESPONSE_BYTES = 64 * 1024
 _MAX_CRITERIA_DESC = 500
 _MAX_GEMINI_OPTIONS = 255     # Gemini choice 最多 255 个选项
+_MAX_MEDIA_BLOCKS = 4         # 单次判定最多带几个图片/语音
+_MAX_MEDIA_BYTES = 4 * 1024 * 1024
+_MEDIA_KINDS = {"Image": "image", "Record": "audio", "Audio": "audio"}
 _MAX_LAST_AGENT = 500         # _last_agent 的 LRU 上限
 _FAIL_THRESHOLD = 3           # 连续失败多少次后熔断
 _FAIL_COOLDOWN = 60.0         # 熔断秒数
@@ -37,13 +43,14 @@ _FAIL_COOLDOWN = 60.0         # 熔断秒数
 
 @register("astrbot_plugin_jev_router", "Amadeus & 相合伞",
           "多代理意图路由（放行式）：Jev / Gemini Decision 判定，仅覆写本轮模型/人设/工具，"
-          "主流程、会话历史与记忆注入归档全程与原生一致", "1.5.1")
+          "主流程、会话历史与记忆注入归档全程与原生一致", "1.6.0")
 class JevRouterPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         self.config = config or {}
         self.session: aiohttp.ClientSession | None = None
         self._session_lock = asyncio.Lock()
+        self._session_loop = None
         self._sem: asyncio.Semaphore | None = None
         # unified_msg_origin -> 上一轮命中的代理名，仅作为 Jev 判定提示，不做粘性
         self._last_agent: OrderedDict[str, str] = OrderedDict()
@@ -58,11 +65,20 @@ class JevRouterPlugin(Star):
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """复用 ClientSession；并发首条消息用锁避免重复建连接池。"""
+        loop = asyncio.get_running_loop()
+        if self.session is not None and not self.session.closed and self._session_loop is not loop:
+            # 事件循环变了（插件重载/测试场景），旧连接池不能再用
+            try:
+                await self.session.close()
+            except Exception:
+                pass
+            self.session = None
         if self.session is not None and not self.session.closed:
             return self.session
         async with self._session_lock:
             if self.session is None or self.session.closed:
                 self.session = aiohttp.ClientSession()
+                self._session_loop = loop
             return self.session
 
     # ---------- 配置解析 ----------
@@ -321,7 +337,9 @@ class JevRouterPlugin(Star):
             conf = 0.0
         return conf
 
-    async def _query_decision(self, state_text: str, agents: list[dict]) -> tuple[str, float]:
+    async def _query_decision(
+        self, state_text: str, agents: list[dict], media: list[dict] | None = None
+    ) -> tuple[str, float]:
         """按配置选择判定后端。Jev 与 Gemini 的答案结构同构，统一返回 (代理名, 置信度)。"""
         if not agents:
             return "", 0.0
@@ -331,7 +349,7 @@ class JevRouterPlugin(Star):
         if not api_key:
             return "", 0.0
         if backend == "gemini":
-            return await self._query_gemini(state_text, agents, api_key)
+            return await self._query_gemini(state_text, agents, api_key, media)
         return await self._query_jev(state_text, agents, api_key)
 
     async def _query_jev(
@@ -393,7 +411,7 @@ class JevRouterPlugin(Star):
             c.isascii() and (c.isalnum() or c in "_-") for c in name
         )
 
-    def _build_gemini_payload(self, state_text: str, agents: list[dict]):
+    def _build_gemini_payload(self, state_text: str, agents: list[dict], media: list[dict] | None = None):
         """构造 Gemini Decisions 请求；返回 (payload, key_map)，key_map 用于把选项键映射回代理名。"""
         criteria: dict[str, str] = {}
         key_map: dict[str, str] = {}
@@ -413,11 +431,15 @@ class JevRouterPlugin(Star):
                 f"Gemini 后端只取前 {_MAX_GEMINI_OPTIONS} 个"
             )
 
+        input_value: object = state_text
+        if media:
+            input_value = [{"type": "text", "text": state_text}, *media]
+
         payload = {
             "model": (
                 self.config.get("gemini_model") or DEFAULT_GEMINI_MODEL
             ).strip().removeprefix("models/"),
-            "input": state_text,
+            "input": input_value,
             "questions": {
                 "agent": {
                     "type": "choice",
@@ -442,39 +464,126 @@ class JevRouterPlugin(Star):
         conf_raw = ans.get("confidence", ans.get("probability", 1.0))
         return choice, self._normalize_conf(conf_raw)
 
+    async def _post_gemini(self, url: str, payload: dict, api_key: str) -> tuple[int, bytes]:
+        headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
+        async with self._get_sem():
+            session = await self._get_session()
+            timeout = aiohttp.ClientTimeout(total=self._get_timeout())
+            async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
+                raw = await resp.content.read(_MAX_RESPONSE_BYTES)
+                return resp.status, raw
+
     async def _query_gemini(
-        self, state_text: str, agents: list[dict], api_key: str
+        self, state_text: str, agents: list[dict], api_key: str,
+        media: list[dict] | None = None,
     ) -> tuple[str, float]:
-        payload, key_map = self._build_gemini_payload(state_text, agents)
+        payload, key_map = self._build_gemini_payload(state_text, agents, media)
         if payload is None:
             return "", 0.0
 
         url = self._resolve_gemini_url()
-        headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
         try:
-            async with self._get_sem():
-                session = await self._get_session()
-                timeout = aiohttp.ClientTimeout(total=self._get_timeout())
-                async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
-                    raw = await resp.content.read(_MAX_RESPONSE_BYTES)
-                    if resp.status != 200:
-                        body = raw[:200].decode("utf-8", "replace").replace(api_key, "***")
-                        logger.warning(
-                            f"[JevRouter] Gemini Decisions 返回非200 ({resp.status}) {url}: {body}"
-                        )
-                        self._note_failure()
-                        return "", 0.0
-                    data = json.loads(raw)
-                self._note_success()
-                blocked = (data.get("prompt_feedback") or {}).get("block_reason")
-                if blocked:
-                    logger.warning(f"[JevRouter] Gemini 判定被拦截: {blocked}")
-                    return "", 0.0
-                return self._parse_gemini_answer(data, key_map)
+            status, raw = await self._post_gemini(url, payload, api_key)
+            if status == 400 and media:
+                # 网关/模型不支持某个媒体类型时，退回纯文本，别让整条消息失去路由
+                logger.warning("[JevRouter] Gemini 拒绝了多模态输入(400)，改用纯文本重试")
+                payload, key_map = self._build_gemini_payload(state_text, agents, None)
+                status, raw = await self._post_gemini(url, payload, api_key)
+            if status != 200:
+                body = raw[:200].decode("utf-8", "replace").replace(api_key, "***")
+                logger.warning(
+                    f"[JevRouter] Gemini Decisions 返回非200 ({status}) {url}: {body}"
+                )
+                self._note_failure()
+                return "", 0.0
+            self._note_success()
+            data = json.loads(raw)
+            blocked = (data.get("prompt_feedback") or {}).get("block_reason")
+            if blocked:
+                logger.warning(f"[JevRouter] Gemini 判定被拦截: {blocked}")
+                return "", 0.0
+            return self._parse_gemini_answer(data, key_map)
         except Exception as e:
             self._note_failure()
             logger.warning(f"[JevRouter] 请求 Gemini 判定失败: {e}")
             return "", 0.0
+
+    async def _media_block(self, path, kind: str) -> dict | None:
+        """把本地文件/data URI 转成 Gemini content block（base64）。"""
+        path = str(path or "")
+        if not path:
+            return None
+        if path.startswith("data:"):
+            try:
+                header, b64 = path.split(",", 1)
+                mime = header[5:].split(";", 1)[0] or (
+                    "image/jpeg" if kind == "image" else "audio/wav"
+                )
+                if len(b64) > _MAX_MEDIA_BYTES * 4 // 3:
+                    return None
+                return {"type": kind, "mime_type": mime, "data": b64}
+            except Exception:
+                return None
+        if path.startswith(("http://", "https://")):
+            # 远程 URL 不在这里下载，避免把任意 URL 变成服务端请求
+            logger.debug("[JevRouter] 媒体仍是远程 URL，跳过多模态判定")
+            return None
+        try:
+            raw = await asyncio.to_thread(Path(path).read_bytes)
+        except Exception as e:
+            logger.debug(f"[JevRouter] 读取媒体文件失败(忽略): {e}")
+            return None
+        if not raw or len(raw) > _MAX_MEDIA_BYTES:
+            logger.debug("[JevRouter] 媒体文件为空或超过大小上限，跳过")
+            return None
+        mime = mimetypes.guess_type(path)[0]
+        if not mime:
+            mime = "image/jpeg" if kind == "image" else "audio/wav"
+        return {
+            "type": kind,
+            "mime_type": mime,
+            "data": base64.b64encode(raw).decode("ascii"),
+        }
+
+    async def _collect_media(self, event: AstrMessageEvent) -> list[dict]:
+        """收集当前消息（含引用消息）里的图片/语音，供 Gemini 多模态判定。"""
+        if not bool(self.config.get("gemini_multimodal", True)):
+            return []
+        try:
+            comps = list(getattr(event.message_obj, "message", []) or [])
+        except Exception:
+            return []
+
+        expanded = []
+        for comp in comps:
+            expanded.append(comp)
+            if type(comp).__name__ == "Reply":
+                chain = getattr(comp, "chain", None)
+                if isinstance(chain, list):
+                    expanded.extend(chain)
+
+        blocks: list[dict] = []
+        for comp in expanded:
+            if len(blocks) >= _MAX_MEDIA_BLOCKS:
+                break
+            kind = _MEDIA_KINDS.get(type(comp).__name__)
+            if not kind:
+                continue
+            convert = getattr(comp, "convert_to_file_path", None)
+            if convert is None:
+                continue
+            try:
+                path = await convert()
+            except Exception as e:
+                logger.debug(f"[JevRouter] 媒体转换失败(忽略): {e}")
+                continue
+            block = await self._media_block(path, kind)
+            if block:
+                blocks.append(block)
+
+        if blocks:
+            logger.debug(f"[JevRouter] 多模态判定附带 {len(blocks)} 个媒体块")
+        return blocks
 
     async def _build_state(self, event: AstrMessageEvent, user_msg: str) -> str:
         """组装喂给 Jev 的 state：近期对话 + 上一轮代理提示 + 当前输入。"""
@@ -534,7 +643,10 @@ class JevRouterPlugin(Star):
             return
 
         state = await self._build_state(event, user_msg)
-        choice, conf = await self._query_decision(state, agents)
+        media = []
+        if self._get_decision_backend() == "gemini":
+            media = await self._collect_media(event)
+        choice, conf = await self._query_decision(state, agents, media)
 
         min_conf = self._get_min_conf()
         if not choice or conf < min_conf:

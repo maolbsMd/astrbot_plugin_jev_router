@@ -5,6 +5,7 @@
 ## ✨ 特性
 
 - **双判定后端**：`decision_backend` 可选 Jev（`/v1/systemone`）或 Google Gemini Decision 1（`/v1beta/decisions`）；两者协议同构，解析后统一映射回代理名
+- **多模态判定（Gemini）**：把消息里的图片/语音一并送给 Gemini Decision 1（最多 4 个、单个 ≤4MB），可以直接按「图里是什么/这段语音在说什么」选代理；Jev 后端只发文本
 - **意图自动路由**：只有**需要 bot 回复**的消息才调用判定（私聊全判；群聊仅 @bot / 引用 bot / 唤醒前缀）
 - **放行式架构**：不拦截、不接管主流程，只通过 `event.set_extra` 与 `on_llm_request` 钩子覆写本轮请求参数，记忆插件、历史归档均感知到统一会话上下文
 - **动态模型切换 + 失败兜底**：命中代理后通过 `selected_provider` 切到本轮模型；**首选调用失败（429/超时/5xx）时按 `fallback_provider_ids` 顺序重试**，成功则用兜底结果替换错误回复
@@ -37,6 +38,7 @@ git clone https://github.com/maolbsMd/astrbot_plugin_jev_router.git
 | `gemini_api_key` | Google AI Studio API Key（仅 gemini 后端使用） | 空 |
 | `gemini_model` | Gemini 判定模型 | `gemini-decision-1` |
 | `gemini_api_url` | Gemini Decisions 地址，填 `.../v1beta` 会自动补全 `/decisions` | `https://generativelanguage.googleapis.com/v1beta` |
+| `gemini_multimodal` | 图片/语音一并送判定（仅 gemini 后端；最多 4 个、单个 ≤4MB） | `true` |
 | `jev_timeout` | 单次判定超时（秒，0.5~10） | `3.0` |
 | `min_confidence` | 最低置信度（0~1），低于此值不切换代理 | `0.55` |
 | `share_context_with_jev` | 判定时是否附带**近期对话原文**（会发送到 `api_url` 指向的第三方服务） | `false` |
@@ -100,6 +102,7 @@ git clone https://github.com/maolbsMd/astrbot_plugin_jev_router.git
 - **对话出站**：`share_context_with_jev` 默认**关闭**，开启后发送的是近期对话**原文**（不是摘要）；群聊里 `conv.history` 是整群共享的，可能包含其他人的消息与工具结果，请确认接收方可信
 - **API Key**：Jev 用 `Authorization: Bearer`，Gemini 用 `x-goog-api-key`；非本机地址的 `http://` 会被强制改成 https（除非显式开启 `allow_insecure_http`），避免明文传输。两个 Key 在 WebUI 里都按 secret 字段处理
 - **Gemini 免费层**：免费层的输入可能被用于改进 Google 产品；敏感场景请用付费层（$0.10/百万输入 token，输出免费）
+- **图片/语音出站**：`gemini_multimodal` 开启时，当前消息（含引用）里的图片/语音会随判定发送到 `gemini_api_url`；Jev 后端只发文本，不受影响
 - **工具边界**：白名单裁剪的是本轮 `func_tool`，不会影响其他请求；如果开启了 AstrBot 的 `computer_use_runtime: local`，`local_execute_shell` / `local_python` / 文件读写等内建工具也会被白名单一并裁剪
 - **成本与可用性**：只对需要回复的消息判定，每条消息最多一次判定调用，并发受限（默认 4），连续失败 3 次熔断 60 秒，超长输入按 6000 字符截断
 - **失败兜底**：`fallback_provider_ids` 只在首选**实际调用失败**（或首选不存在）时生效；兜底回复不带工具调用，只保证用户拿到回答
@@ -112,6 +115,12 @@ git clone https://github.com/maolbsMd/astrbot_plugin_jev_router.git
 - 同一个模型人设 prompt 等保持一致，所以缓存命中率对每个模型并没有影响，但要避免短时间使用太多不同代理
 
 ## 📋 更新日志
+
+### 1.6.0
+
+- Gemini 判定支持多模态：消息（含引用消息）里的图片/语音以 content block 形式随 `input` 发送
+- 最多 4 个、单个 ≤4MB；远程 URL 不主动下载，`data:` URI 直接透传；多模态被 400 拒绝时自动退回纯文本重试
+- 新增 `gemini_multimodal`（默认开启）；Jev 后端仍然只发文本
 
 ### 1.5.1
 

@@ -51,6 +51,12 @@
     "hint": "填裸域名（自动补 /v1beta/decisions）、.../v1beta（补 /decisions）或完整 endpoint 均可；仅支持 Gemini Developer API（Vertex 不支持）",
     "default": "https://generativelanguage.googleapis.com/v1beta"
   },
+  "gemini_multimodal": {
+    "description": "多模态判定（图片/语音）",
+    "type": "bool",
+    "hint": "默认开启：把当前消息（含引用消息）里的图片和语音一并送给 Gemini 判定，最多 4 个、单个 ≤4MB；Jev 后端不支持，会自动忽略。图片/语音会发送到 gemini_api_url 指向的服务",
+    "default": true
+  },
   "jev_timeout": {
     "description": "判定超时（秒）",
     "type": "float",
