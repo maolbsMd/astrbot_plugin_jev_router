@@ -1,7 +1,16 @@
 {
+  "decision_backend": {
+    "description": "判定后端",
+    "type": "string",
+    "options": ["jev", "gemini"],
+    "labels": ["TypeSafe Jev", "Google Gemini Decision 1"],
+    "hint": "用哪个决策模型判定意图。Jev 便宜（约 $0.042/百万输入 token，纯文本）；Gemini Decision 1 支持多模态，$0.10/百万输入 token、输出免费，单次最多 1000 个问题",
+    "default": "jev"
+  },
   "typesafe_api_key": {
     "description": "TypeSafe (Jev) API Key",
     "type": "string",
+    "secret": true,
     "hint": "在 api.typesafe.ai 获取，用于意图分类判定",
     "default": ""
   },
@@ -23,10 +32,29 @@
     "hint": "默认 jev-latest，或指定版本如 jev-1.13.0",
     "default": "jev-latest"
   },
+  "gemini_api_key": {
+    "description": "Google AI Studio API Key",
+    "type": "string",
+    "secret": true,
+    "hint": "仅在判定后端选 gemini 时使用；在 AI Studio 创建。免费层输入可能被用于改进 Google 产品，敏感场景请用付费层",
+    "default": ""
+  },
+  "gemini_model": {
+    "description": "Gemini 判定模型",
+    "type": "string",
+    "hint": "默认 gemini-decision-1；会自动去掉 models/ 前缀",
+    "default": "gemini-decision-1"
+  },
+  "gemini_api_url": {
+    "description": "Gemini Decisions 地址",
+    "type": "string",
+    "hint": "默认 https://generativelanguage.googleapis.com/v1beta，自动补全 /decisions；仅支持 Gemini Developer API（Vertex 不支持）",
+    "default": "https://generativelanguage.googleapis.com/v1beta"
+  },
   "jev_timeout": {
     "description": "判定超时（秒）",
     "type": "float",
-    "hint": "单次 Jev 请求超时，0.5~10。Jev 不可用时每条消息都会先等到这个时间",
+    "hint": "单次判定请求超时，0.5~10。判定接口不可用时每条消息都会先等到这个时间",
     "default": 3.0
   },
   "min_confidence": {

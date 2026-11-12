@@ -22,19 +22,22 @@ _K_AGENT = "jev_router_agent_name"    # 本轮命中的代理名
 _K_FAILOVER = "jev_router_failover"   # 已用兜底 provider 答复过（防止重复兜底）
 
 DEFAULT_JEV_URL = "https://api.typesafe.ai/v1/systemone"
+DEFAULT_GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta"
+DEFAULT_GEMINI_MODEL = "gemini-decision-1"
 
 _MAX_HISTORY_ROUNDS = 50      # 单轮最多喂多少轮历史
-_MAX_STATE_CHARS = 6000       # 送给 Jev 的 state 上限，防止超长消息放大成本
+_MAX_STATE_CHARS = 6000       # 送给判定接口的 state 上限，防止超长消息放大成本
 _MAX_RESPONSE_BYTES = 64 * 1024
 _MAX_CRITERIA_DESC = 500
+_MAX_GEMINI_OPTIONS = 255     # Gemini choice 最多 255 个选项
 _MAX_LAST_AGENT = 500         # _last_agent 的 LRU 上限
 _FAIL_THRESHOLD = 3           # 连续失败多少次后熔断
 _FAIL_COOLDOWN = 60.0         # 熔断秒数
 
 
 @register("astrbot_plugin_jev_router", "Amadeus & 相合伞",
-          "基于 TypeSafe Jev 的意图路由（放行式）：仅覆写本轮模型/人设/工具，"
-          "主流程、会话历史与记忆注入归档全程与原生一致", "1.4.0")
+          "多代理意图路由（放行式）：Jev / Gemini Decision 判定，仅覆写本轮模型/人设/工具，"
+          "主流程、会话历史与记忆注入归档全程与原生一致", "1.5.0")
 class JevRouterPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
@@ -123,38 +126,53 @@ class JevRouterPlugin(Star):
             res.append(a)
         return res
 
-    def _resolve_api_url(self) -> str:
-        """解析并自动补全 Jev API 地址，兼容填 base_url 或完整 endpoint 的情况。"""
-        raw = (self.config.get("api_url") or DEFAULT_JEV_URL).strip().rstrip("/")
-        if not raw:
-            return DEFAULT_JEV_URL
+    def _force_https(self, raw: str) -> str:
+        """补全 scheme；非本机的明文 http 在未显式放行时升级为 https。"""
         if "://" not in raw:
             raw = "https://" + raw
         scheme, rest = raw.split("://", 1)
         scheme = scheme.lower()
         if scheme not in ("http", "https"):
-            return DEFAULT_JEV_URL
+            return ""
         host_port = rest.split("/", 1)[0].split("@")[-1]
         if host_port.startswith("["):  # IPv6，如 [::1]:8080
             host = host_port[1:].split("]")[0].lower()
         else:
             host = host_port.split(":")[0].lower()
         if scheme == "http" and host not in ("localhost", "127.0.0.1", "::1"):
-            # Bearer token 走明文 http 等于直接泄露 API Key
+            # API Key 走明文 http 等于直接泄露
             if not bool(self.config.get("allow_insecure_http", False)):
                 if not self._warned_http:
                     logger.warning(
-                        "[JevRouter] api_url 使用了明文 http，已按 https 处理；"
+                        "[JevRouter] 判定接口使用了明文 http，已按 https 处理；"
                         "确需明文请开启 allow_insecure_http"
                     )
                     self._warned_http = True
                 raw = "https://" + rest
+        return raw
+
+    def _resolve_api_url(self) -> str:
+        """解析并自动补全 Jev API 地址，兼容填 base_url 或完整 endpoint 的情况。"""
+        raw = (self.config.get("api_url") or DEFAULT_JEV_URL).strip().rstrip("/")
+        raw = self._force_https(raw) if raw else ""
+        if not raw:
+            return DEFAULT_JEV_URL
         # 如果只填了域名 (如 https://api.typesafe.ai) 或 /v1，自动补全 /v1/systemone
         if raw.endswith("/v1"):
             return raw + "/systemone"
         if "/v1/" not in raw and not raw.endswith("/systemone"):
             return raw + "/v1/systemone"
         return raw
+
+    def _resolve_gemini_url(self) -> str:
+        """解析并自动补全 Gemini Decisions 地址（填 base 或完整 endpoint 均可）。"""
+        raw = (self.config.get("gemini_api_url") or DEFAULT_GEMINI_URL).strip().rstrip("/")
+        raw = self._force_https(raw) if raw else ""
+        if not raw:
+            return DEFAULT_GEMINI_URL + "/decisions"
+        if raw.endswith("/decisions"):
+            return raw
+        return raw + "/decisions"
 
     def _get_provider(self, provider_id: str):
         try:
@@ -265,18 +283,50 @@ class JevRouterPlugin(Star):
             self._fail_until = time.monotonic() + _FAIL_COOLDOWN
             self._fail_count = 0
             logger.warning(
-                "[JevRouter] Jev 连续失败 %s 次，熔断 %s 秒，期间直接走默认主流程",
+                "[JevRouter] 判定接口连续失败 %s 次，熔断 %s 秒，期间直接走默认主流程",
                 _FAIL_THRESHOLD,
                 int(_FAIL_COOLDOWN),
             )
 
-    # ---------- Jev 意图判定 ----------
+    # ---------- 判定后端（Jev / Gemini Decision） ----------
 
-    async def _query_jev(self, state_text: str, agents: list[dict]) -> tuple[str, float]:
-        api_key = (self.config.get("typesafe_api_key") or "").strip()
-        if not api_key or not agents:
+    def _get_decision_backend(self) -> str:
+        backend = str(self.config.get("decision_backend") or "jev").strip().lower()
+        if backend not in ("jev", "gemini"):
+            logger.warning(f"[JevRouter] 未知判定后端 {backend!r}，回退到 jev")
+            return "jev"
+        return backend
+
+    def _normalize_conf(self, value, default: float = 1.0) -> float:
+        """统一置信度：容错、NaN 归零、百分制归一化。"""
+        try:
+            conf = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(conf):
+            return 0.0
+        if 1.0 < conf <= 100.0:
+            conf = conf / 100.0
+        elif conf < 0.0 or conf > 100.0:
+            conf = 0.0
+        return conf
+
+    async def _query_decision(self, state_text: str, agents: list[dict]) -> tuple[str, float]:
+        """按配置选择判定后端。Jev 与 Gemini 的答案结构同构，统一返回 (代理名, 置信度)。"""
+        if not agents:
             return "", 0.0
+        backend = self._get_decision_backend()
+        key_name = "gemini_api_key" if backend == "gemini" else "typesafe_api_key"
+        api_key = (self.config.get(key_name) or "").strip()
+        if not api_key:
+            return "", 0.0
+        if backend == "gemini":
+            return await self._query_gemini(state_text, agents, api_key)
+        return await self._query_jev(state_text, agents, api_key)
 
+    async def _query_jev(
+        self, state_text: str, agents: list[dict], api_key: str
+    ) -> tuple[str, float]:
         # Jev 官方 SystemOne 协议：choice 必须要有 criteria 字典映射
         criteria = {}
         for a in agents:
@@ -315,26 +365,105 @@ class JevRouterPlugin(Star):
                         return "", 0.0
                     data = json.loads(raw)
                 self._note_success()
-                ans = data.get("answers", {}).get("agent", {})
+                ans = (data.get("answers") or {}).get("agent", {})
                 if isinstance(ans, str):
                     return ans, 1.0
                 choice = ans.get("choice", "") or ans.get("value", "") or ""
                 conf_raw = ans.get("confidence", ans.get("score", ans.get("probability", 1.0)))
-                try:
-                    conf = float(conf_raw)
-                except (TypeError, ValueError):
-                    conf = 1.0
-                if not math.isfinite(conf):
-                    conf = 0.0
-                elif 1.0 < conf <= 100.0:
-                    # 兼容按百分制返回的实现
-                    conf = conf / 100.0
-                elif conf > 100.0 or conf < 0.0:
-                    conf = 0.0
-                return str(choice).strip(), conf
+                return str(choice).strip(), self._normalize_conf(conf_raw)
         except Exception as e:
             self._note_failure()
             logger.warning(f"[JevRouter] 请求 Jev 判定失败: {e}")
+            return "", 0.0
+
+    @staticmethod
+    def _is_safe_option_key(name: str) -> bool:
+        """Gemini 的选项键只允许 [A-Za-z0-9_-]{1,64}。"""
+        return bool(name) and len(name) <= 64 and all(
+            c.isascii() and (c.isalnum() or c in "_-") for c in name
+        )
+
+    def _build_gemini_payload(self, state_text: str, agents: list[dict]):
+        """构造 Gemini Decisions 请求；返回 (payload, key_map)，key_map 用于把选项键映射回代理名。"""
+        criteria: dict[str, str] = {}
+        key_map: dict[str, str] = {}
+        for idx, a in enumerate(agents[:_MAX_GEMINI_OPTIONS]):
+            name = a["name"]
+            key = name if self._is_safe_option_key(name) and name not in criteria else f"a{idx}"
+            criteria[key] = (str(a.get("desc") or "").strip() or name)[:_MAX_CRITERIA_DESC]
+            key_map[key] = name
+
+        if len(criteria) < 2:
+            # Gemini 的 choice 至少要有 2 个选项
+            logger.debug("[JevRouter] Gemini choice 至少需要 2 个候选代理，跳过判定")
+            return None, {}
+        if len(agents) > _MAX_GEMINI_OPTIONS:
+            logger.warning(
+                f"[JevRouter] 代理数量超过 {_MAX_GEMINI_OPTIONS}，"
+                f"Gemini 后端只取前 {_MAX_GEMINI_OPTIONS} 个"
+            )
+
+        payload = {
+            "model": (
+                self.config.get("gemini_model") or DEFAULT_GEMINI_MODEL
+            ).strip().removeprefix("models/"),
+            "input": state_text,
+            "questions": {
+                "agent": {
+                    "type": "choice",
+                    "instructions": "根据用户当前输入和近期对话，选择最匹配的处理的子代理。",
+                    "criteria": criteria,
+                }
+            },
+        }
+        return payload, key_map
+
+    def _parse_gemini_answer(self, data: dict, key_map: dict[str, str]) -> tuple[str, float]:
+        ans = (data.get("answers") or {}).get("agent") or {}
+        if not isinstance(ans, dict):
+            return "", 0.0
+        raw_choice = str(ans.get("choice") or ans.get("value") or "").strip()
+        choice = key_map.get(raw_choice)
+        if choice is None and raw_choice in key_map.values():
+            # 兼容直接回显选项文本的实现
+            choice = raw_choice
+        if not choice:
+            return "", 0.0
+        conf_raw = ans.get("confidence", ans.get("probability", 1.0))
+        return choice, self._normalize_conf(conf_raw)
+
+    async def _query_gemini(
+        self, state_text: str, agents: list[dict], api_key: str
+    ) -> tuple[str, float]:
+        payload, key_map = self._build_gemini_payload(state_text, agents)
+        if payload is None:
+            return "", 0.0
+
+        url = self._resolve_gemini_url()
+        headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
+        try:
+            async with self._get_sem():
+                session = await self._get_session()
+                timeout = aiohttp.ClientTimeout(total=self._get_timeout())
+                async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
+                    raw = await resp.content.read(_MAX_RESPONSE_BYTES)
+                    if resp.status != 200:
+                        body = raw[:200].decode("utf-8", "replace").replace(api_key, "***")
+                        logger.warning(
+                            f"[JevRouter] Gemini Decisions 返回非200 ({resp.status}): {body}"
+                        )
+                        self._note_failure()
+                        return "", 0.0
+                    data = json.loads(raw)
+                self._note_success()
+                blocked = (data.get("prompt_feedback") or {}).get("block_reason")
+                if blocked:
+                    logger.warning(f"[JevRouter] Gemini 判定被拦截: {blocked}")
+                    return "", 0.0
+                return self._parse_gemini_answer(data, key_map)
+        except Exception as e:
+            self._note_failure()
+            logger.warning(f"[JevRouter] 请求 Gemini 判定失败: {e}")
             return "", 0.0
 
     async def _build_state(self, event: AstrMessageEvent, user_msg: str) -> str:
@@ -395,7 +524,7 @@ class JevRouterPlugin(Star):
             return
 
         state = await self._build_state(event, user_msg)
-        choice, conf = await self._query_jev(state, agents)
+        choice, conf = await self._query_decision(state, agents)
 
         min_conf = self._get_min_conf()
         if not choice or conf < min_conf:

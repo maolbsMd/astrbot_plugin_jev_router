@@ -1,17 +1,18 @@
 # astrbot_plugin_jev_router
 
-基于 **TypeSafe Jev** 的多代理意图路由插件（放行式）—— 仅覆写本轮的模型 / 人设 / 工具白名单，AstrBot 主流程、会话历史归档与记忆注入全程与原生完全一致。
+基于 **TypeSafe Jev** / **Google Gemini Decision 1** 的多代理意图路由插件（放行式）—— 仅覆写本轮的模型 / 人设 / 工具白名单，AstrBot 主流程、会话历史归档与记忆注入全程与原生完全一致。
 
 ## ✨ 特性
 
-- **意图自动路由**：只有**需要 bot 回复**的消息才调用 Jev（私聊全判；群聊仅 @bot / 引用 bot / 唤醒前缀）
+- **双判定后端**：`decision_backend` 可选 Jev（`/v1/systemone`）或 Google Gemini Decision 1（`/v1beta/decisions`）；两者协议同构，解析后统一映射回代理名
+- **意图自动路由**：只有**需要 bot 回复**的消息才调用判定（私聊全判；群聊仅 @bot / 引用 bot / 唤醒前缀）
 - **放行式架构**：不拦截、不接管主流程，只通过 `event.set_extra` 与 `on_llm_request` 钩子覆写本轮请求参数，记忆插件、历史归档均感知到统一会话上下文
 - **动态模型切换 + 失败兜底**：命中代理后通过 `selected_provider` 切到本轮模型；**首选调用失败（429/超时/5xx）时按 `fallback_provider_ids` 顺序重试**，成功则用兜底结果替换错误回复
 - **人设追加模式**：子代理的 persona / system_prompt 以**追加**方式拼在原 system_prompt 之后，绝不清空原有人设与记忆注入
 - **工具白名单（fail-closed）**：按插件名或精确工具名限制可用工具；`*` 才全放行，留空表示**不给任何工具**
-- **上下文感知判定**：可选把近期对话原文与上一轮命中的代理名喂给 Jev，提升「改一下」「继续」这类续聊输入的路由准确率（默认关闭，见「隐私」）
-- **API 地址自动补全**：填域名、`/v1` 或完整 endpoint 均可，自动补全为 `/v1/systemone`
-- **优雅降级**：Jev 请求失败、置信度低于阈值或未命中代理时，本轮自动回落默认主流程；连续失败会熔断 60 秒
+- **上下文感知判定**：可选把近期对话原文与上一轮命中的代理名喂给判定接口，提升「改一下」「继续」这类续聊输入的路由准确率（默认关闭，见「隐私」）
+- **API 地址自动补全**：Jev 填域名、`/v1` 或完整 endpoint 均可；Gemini 填 `.../v1beta` 会自动补全 `/decisions`
+- **优雅降级**：判定请求失败、置信度低于阈值或未命中代理时，本轮自动回落默认主流程；连续失败会熔断 60 秒
 
 ## 📦 安装
 
@@ -28,10 +29,14 @@ git clone https://github.com/maolbsMd/astrbot_plugin_jev_router.git
 
 | 配置项 | 说明 | 默认值 |
 | --- | --- | --- |
+| `decision_backend` | 判定后端：`jev` 或 `gemini` | `jev` |
 | `typesafe_api_key` | TypeSafe (Jev) API Key，在 api.typesafe.ai 获取 | 空 |
 | `api_url` | Jev 请求地址，支持反代/转发网关，自动补全路径；非本机地址的 `http://` 会被强制升级为 https | `https://api.typesafe.ai/v1/systemone` |
 | `allow_insecure_http` | 允许明文 http（仅内网网关且网络可信时开启） | `false` |
 | `jev_model` | Jev 判定模型版本 | `jev-latest` |
+| `gemini_api_key` | Google AI Studio API Key（仅 gemini 后端使用） | 空 |
+| `gemini_model` | Gemini 判定模型 | `gemini-decision-1` |
+| `gemini_api_url` | Gemini Decisions 地址，填 `.../v1beta` 会自动补全 `/decisions` | `https://generativelanguage.googleapis.com/v1beta` |
 | `jev_timeout` | 单次判定超时（秒，0.5~10） | `3.0` |
 | `min_confidence` | 最低置信度（0~1），低于此值不切换代理 | `0.55` |
 | `share_context_with_jev` | 判定时是否附带**近期对话原文**（会发送到 `api_url` 指向的第三方服务） | `false` |
@@ -66,7 +71,7 @@ git clone https://github.com/maolbsMd/astrbot_plugin_jev_router.git
    ▼                             ▼
 走默认主流程              [on_message_route]  跳过 / 开头指令、熔断期内直接放行
                                  │                组装 state（近期对话 + 上轮代理 + 当前输入）
-                                 │                调用 Jev SystemOne 判定意图（限并发）
+                                 │                调用 Jev / Gemini Decision 判定意图（限并发）
                                  ▼
                           命中代理且置信度 ≥ 阈值？
                                  │ 是                          │ 否
@@ -93,9 +98,10 @@ git clone https://github.com/maolbsMd/astrbot_plugin_jev_router.git
 ## 🔒 隐私与安全
 
 - **对话出站**：`share_context_with_jev` 默认**关闭**，开启后发送的是近期对话**原文**（不是摘要）；群聊里 `conv.history` 是整群共享的，可能包含其他人的消息与工具结果，请确认接收方可信
-- **API Key**：`typesafe_api_key` 会以 `Authorization: Bearer` 发往 `api_url`；非本机地址的 `http://` 会被强制改成 https（除非显式开启 `allow_insecure_http`），避免明文传输
+- **API Key**：Jev 用 `Authorization: Bearer`，Gemini 用 `x-goog-api-key`；非本机地址的 `http://` 会被强制改成 https（除非显式开启 `allow_insecure_http`），避免明文传输。两个 Key 在 WebUI 里都按 secret 字段处理
+- **Gemini 免费层**：免费层的输入可能被用于改进 Google 产品；敏感场景请用付费层（$0.10/百万输入 token，输出免费）
 - **工具边界**：白名单裁剪的是本轮 `func_tool`，不会影响其他请求；如果开启了 AstrBot 的 `computer_use_runtime: local`，`local_execute_shell` / `local_python` / 文件读写等内建工具也会被白名单一并裁剪
-- **成本与可用性**：只对需要回复的消息判定，每条消息最多一次 Jev 调用，并发受限（默认 4），连续失败 3 次熔断 60 秒，超长输入按 6000 字符截断
+- **成本与可用性**：只对需要回复的消息判定，每条消息最多一次判定调用，并发受限（默认 4），连续失败 3 次熔断 60 秒，超长输入按 6000 字符截断
 - **失败兜底**：`fallback_provider_ids` 只在首选**实际调用失败**（或首选不存在）时生效；兜底回复不带工具调用，只保证用户拿到回答
 
 ## 📝 注意事项
@@ -106,6 +112,14 @@ git clone https://github.com/maolbsMd/astrbot_plugin_jev_router.git
 - 同一个模型人设 prompt 等保持一致，所以缓存命中率对每个模型并没有影响，但要避免短时间使用太多不同代理
 
 ## 📋 更新日志
+
+### 1.5.0
+
+- 新增 `decision_backend`：可选 `jev`（TypeSafe SystemOne）或 `gemini`（Google Gemini Decision 1）
+- Gemini 后端：`POST {gemini_api_url}/decisions`，`x-goog-api-key` 认证，请求用 `input` 替代 Jev 的 `state`，其余 question/answers 结构同构
+- Gemini 选项键自动收敛到 `[A-Za-z0-9_-]{1,64}`（中文/带点号的代理名会映射为 `a0..aN` 再映射回来），不足 2 个候选时跳过判定
+- 置信度归一化、限流、熔断、超时、错误脱敏由两个后端共用；`prompt_feedback.block_reason` 视为判定失败
+- 两个 API Key 在配置页标记为 secret
 
 ### 1.4.0
 
