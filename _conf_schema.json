@@ -54,8 +54,14 @@
   "gemini_multimodal": {
     "description": "多模态判定（图片/语音）",
     "type": "bool",
-    "hint": "默认开启：把当前消息（含引用消息）里的图片和语音一并送给 Gemini 判定，最多 4 个、单个 ≤4MB；Jev 后端不支持，会自动忽略。图片/语音会发送到 gemini_api_url 指向的服务",
+    "hint": "默认开启：把当前消息（含引用消息）里的图片和语音一并送给 Gemini 判定；Jev 后端不支持，会自动忽略。图片/语音会发送到 gemini_api_url 指向的服务",
     "default": true
+  },
+  "media_max_mb": {
+    "description": "单个图片/语音上限（MB）",
+    "type": "float",
+    "hint": "1~20，默认 10。单次请求媒体总量上限为 14MB（base64 后约 18.7MB，控制在 Gemini 内联请求 20MB 以内）；网关有请求体大小限制时调小",
+    "default": 10.0
   },
   "jev_timeout": {
     "description": "判定超时（秒）",

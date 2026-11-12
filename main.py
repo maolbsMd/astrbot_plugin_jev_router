@@ -34,7 +34,8 @@ _MAX_RESPONSE_BYTES = 64 * 1024
 _MAX_CRITERIA_DESC = 500
 _MAX_GEMINI_OPTIONS = 255     # Gemini choice 最多 255 个选项
 _MAX_MEDIA_BLOCKS = 4         # 单次判定最多带几个图片/语音
-_MAX_MEDIA_BYTES = 4 * 1024 * 1024
+_MAX_MEDIA_TOTAL_BYTES = 14 * 1024 * 1024  # 单次请求媒体总量（原始字节，base64 后约 18.7MB）
+_DEFAULT_MEDIA_MAX_MB = 10.0  # 单个媒体默认上限，可在配置里改
 _MEDIA_KINDS = {"Image": "image", "Record": "audio", "Audio": "audio"}
 _MAX_LAST_AGENT = 500         # _last_agent 的 LRU 上限
 _FAIL_THRESHOLD = 3           # 连续失败多少次后熔断
@@ -43,7 +44,7 @@ _FAIL_COOLDOWN = 60.0         # 熔断秒数
 
 @register("astrbot_plugin_jev_router", "Amadeus & 相合伞",
           "多代理意图路由（放行式）：Jev / Gemini Decision 判定，仅覆写本轮模型/人设/工具，"
-          "主流程、会话历史与记忆注入归档全程与原生一致", "1.6.0")
+          "主流程、会话历史与记忆注入归档全程与原生一致", "1.7.0")
 class JevRouterPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
@@ -114,6 +115,10 @@ class JevRouterPlugin(Star):
 
     def _get_timeout(self) -> float:
         return self._get_float("jev_timeout", 3.0, 0.5, 10.0)
+
+    def _get_media_max_bytes(self) -> int:
+        mb = self._get_float("media_max_mb", _DEFAULT_MEDIA_MAX_MB, 1.0, 20.0)
+        return int(mb * 1024 * 1024)
 
     def _get_sem(self) -> asyncio.Semaphore:
         if self._sem is None:
@@ -508,42 +513,45 @@ class JevRouterPlugin(Star):
             logger.warning(f"[JevRouter] 请求 Gemini 判定失败: {e}")
             return "", 0.0
 
-    async def _media_block(self, path, kind: str) -> dict | None:
-        """把本地文件/data URI 转成 Gemini content block（base64）。"""
+    async def _media_block(self, path, kind: str, max_bytes: int) -> tuple[dict | None, int]:
+        """把本地文件/data URI 转成 Gemini content block；返回 (block, 原始字节数)。"""
         path = str(path or "")
         if not path:
-            return None
+            return None, 0
         if path.startswith("data:"):
             try:
                 header, b64 = path.split(",", 1)
+                size = len(b64) * 3 // 4
+                if size > max_bytes:
+                    logger.debug("[JevRouter] data URI 超过单文件上限，跳过")
+                    return None, size
                 mime = header[5:].split(";", 1)[0] or (
                     "image/jpeg" if kind == "image" else "audio/wav"
                 )
-                if len(b64) > _MAX_MEDIA_BYTES * 4 // 3:
-                    return None
-                return {"type": kind, "mime_type": mime, "data": b64}
+                return {"type": kind, "mime_type": mime, "data": b64}, size
             except Exception:
-                return None
+                return None, 0
         if path.startswith(("http://", "https://")):
             # 远程 URL 不在这里下载，避免把任意 URL 变成服务端请求
             logger.debug("[JevRouter] 媒体仍是远程 URL，跳过多模态判定")
-            return None
+            return None, 0
         try:
             raw = await asyncio.to_thread(Path(path).read_bytes)
         except Exception as e:
             logger.debug(f"[JevRouter] 读取媒体文件失败(忽略): {e}")
-            return None
-        if not raw or len(raw) > _MAX_MEDIA_BYTES:
-            logger.debug("[JevRouter] 媒体文件为空或超过大小上限，跳过")
-            return None
+            return None, 0
+        if not raw or len(raw) > max_bytes:
+            logger.debug("[JevRouter] 媒体文件为空或超过单文件上限，跳过")
+            return None, len(raw)
         mime = mimetypes.guess_type(path)[0]
         if not mime:
             mime = "image/jpeg" if kind == "image" else "audio/wav"
-        return {
+        block = {
             "type": kind,
             "mime_type": mime,
             "data": base64.b64encode(raw).decode("ascii"),
         }
+        return block, len(raw)
 
     async def _collect_media(self, event: AstrMessageEvent) -> list[dict]:
         """收集当前消息（含引用消息）里的图片/语音，供 Gemini 多模态判定。"""
@@ -563,6 +571,8 @@ class JevRouterPlugin(Star):
                     expanded.extend(chain)
 
         blocks: list[dict] = []
+        max_bytes = self._get_media_max_bytes()
+        total = 0
         for comp in expanded:
             if len(blocks) >= _MAX_MEDIA_BLOCKS:
                 break
@@ -577,12 +587,20 @@ class JevRouterPlugin(Star):
             except Exception as e:
                 logger.debug(f"[JevRouter] 媒体转换失败(忽略): {e}")
                 continue
-            block = await self._media_block(path, kind)
-            if block:
-                blocks.append(block)
+            block, size = await self._media_block(path, kind, max_bytes)
+            if block is None:
+                continue
+            if total + size > _MAX_MEDIA_TOTAL_BYTES:
+                logger.debug("[JevRouter] 媒体总量超过上限，停止收集")
+                break
+            blocks.append(block)
+            total += size
 
         if blocks:
-            logger.debug(f"[JevRouter] 多模态判定附带 {len(blocks)} 个媒体块")
+            logger.debug(
+                f"[JevRouter] 多模态判定附带 {len(blocks)} 个媒体块"
+                f"（{total / 1024 / 1024:.1f}MB）"
+            )
         return blocks
 
     async def _build_state(self, event: AstrMessageEvent, user_msg: str) -> str:

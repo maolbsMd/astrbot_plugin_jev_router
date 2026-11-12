@@ -5,7 +5,7 @@
 ## ✨ 特性
 
 - **双判定后端**：`decision_backend` 可选 Jev（`/v1/systemone`）或 Google Gemini Decision 1（`/v1beta/decisions`）；两者协议同构，解析后统一映射回代理名
-- **多模态判定（Gemini）**：把消息里的图片/语音一并送给 Gemini Decision 1（最多 4 个、单个 ≤4MB），可以直接按「图里是什么/这段语音在说什么」选代理；Jev 后端只发文本
+- **多模态判定（Gemini）**：把消息里的图片/语音一并送给 Gemini Decision 1（最多 4 个、单个默认 ≤10MB、总量 14MB），可以直接按「图里是什么/这段语音在说什么」选代理；Jev 后端只发文本
 - **意图自动路由**：只有**需要 bot 回复**的消息才调用判定（私聊全判；群聊仅 @bot / 引用 bot / 唤醒前缀）
 - **放行式架构**：不拦截、不接管主流程，只通过 `event.set_extra` 与 `on_llm_request` 钩子覆写本轮请求参数，记忆插件、历史归档均感知到统一会话上下文
 - **动态模型切换 + 失败兜底**：命中代理后通过 `selected_provider` 切到本轮模型；**首选调用失败（429/超时/5xx）时按 `fallback_provider_ids` 顺序重试**，成功则用兜底结果替换错误回复
@@ -38,7 +38,8 @@ git clone https://github.com/maolbsMd/astrbot_plugin_jev_router.git
 | `gemini_api_key` | Google AI Studio API Key（仅 gemini 后端使用） | 空 |
 | `gemini_model` | Gemini 判定模型 | `gemini-decision-1` |
 | `gemini_api_url` | Gemini Decisions 地址，填 `.../v1beta` 会自动补全 `/decisions` | `https://generativelanguage.googleapis.com/v1beta` |
-| `gemini_multimodal` | 图片/语音一并送判定（仅 gemini 后端；最多 4 个、单个 ≤4MB） | `true` |
+| `gemini_multimodal` | 图片/语音一并送判定（仅 gemini 后端；最多 4 个） | `true` |
+| `media_max_mb` | 单个图片/语音上限（MB，1~20）；单次请求媒体总量固定 14MB | `10.0` |
 | `jev_timeout` | 单次判定超时（秒，0.5~10） | `3.0` |
 | `min_confidence` | 最低置信度（0~1），低于此值不切换代理 | `0.55` |
 | `share_context_with_jev` | 判定时是否附带**近期对话原文**（会发送到 `api_url` 指向的第三方服务） | `false` |
@@ -115,6 +116,12 @@ git clone https://github.com/maolbsMd/astrbot_plugin_jev_router.git
 - 同一个模型人设 prompt 等保持一致，所以缓存命中率对每个模型并没有影响，但要避免短时间使用太多不同代理
 
 ## 📋 更新日志
+
+### 1.7.0
+
+- 多模态单文件上限从固定 4MB 改为可配 `media_max_mb`（默认 10MB，范围 1~20）
+- 新增单次请求媒体总量上限 14MB（base64 后约 18.7MB，控制在 Gemini 内联请求 20MB 内），超出的后续媒体跳过
+- 调试日志会打印实际附带的总大小，便于排查 413/400
 
 ### 1.6.0
 
