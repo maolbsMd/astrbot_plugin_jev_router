@@ -48,7 +48,7 @@
   "gemini_api_url": {
     "description": "Gemini Decisions 地址",
     "type": "string",
-    "hint": "默认 https://generativelanguage.googleapis.com/v1beta，自动补全 /decisions；仅支持 Gemini Developer API（Vertex 不支持）",
+    "hint": "填裸域名（自动补 /v1beta/decisions）、.../v1beta（补 /decisions）或完整 endpoint 均可；仅支持 Gemini Developer API（Vertex 不支持）",
     "default": "https://generativelanguage.googleapis.com/v1beta"
   },
   "jev_timeout": {

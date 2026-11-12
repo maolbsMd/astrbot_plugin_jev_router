@@ -37,7 +37,7 @@ _FAIL_COOLDOWN = 60.0         # 熔断秒数
 
 @register("astrbot_plugin_jev_router", "Amadeus & 相合伞",
           "多代理意图路由（放行式）：Jev / Gemini Decision 判定，仅覆写本轮模型/人设/工具，"
-          "主流程、会话历史与记忆注入归档全程与原生一致", "1.5.0")
+          "主流程、会话历史与记忆注入归档全程与原生一致", "1.5.1")
 class JevRouterPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
@@ -165,13 +165,23 @@ class JevRouterPlugin(Star):
         return raw
 
     def _resolve_gemini_url(self) -> str:
-        """解析并自动补全 Gemini Decisions 地址（填 base 或完整 endpoint 均可）。"""
+        """解析并自动补全 Gemini Decisions 地址。
+
+        兼容三种填法：裸域名（补 /v1beta/decisions）、base（/v1beta 补 /decisions）、
+        完整 endpoint（原样使用）；带自定义路径的网关只在后面补 /decisions。
+        """
         raw = (self.config.get("gemini_api_url") or DEFAULT_GEMINI_URL).strip().rstrip("/")
         raw = self._force_https(raw) if raw else ""
         if not raw:
             return DEFAULT_GEMINI_URL + "/decisions"
         if raw.endswith("/decisions"):
             return raw
+        if raw.endswith("/v1beta"):
+            return raw + "/decisions"
+        after_scheme = raw.split("://", 1)[-1]
+        if "/" not in after_scheme:
+            # 只填了域名（可能带端口），按官方结构补全
+            return raw + "/v1beta/decisions"
         return raw + "/decisions"
 
     def _get_provider(self, provider_id: str):
@@ -360,7 +370,7 @@ class JevRouterPlugin(Star):
                     raw = await resp.content.read(_MAX_RESPONSE_BYTES)
                     if resp.status != 200:
                         body = raw[:200].decode("utf-8", "replace").replace(api_key, "***")
-                        logger.warning(f"[JevRouter] Jev 返回非200 ({resp.status}): {body}")
+                        logger.warning(f"[JevRouter] Jev 返回非200 ({resp.status}) {url}: {body}")
                         self._note_failure()
                         return "", 0.0
                     data = json.loads(raw)
@@ -450,7 +460,7 @@ class JevRouterPlugin(Star):
                     if resp.status != 200:
                         body = raw[:200].decode("utf-8", "replace").replace(api_key, "***")
                         logger.warning(
-                            f"[JevRouter] Gemini Decisions 返回非200 ({resp.status}): {body}"
+                            f"[JevRouter] Gemini Decisions 返回非200 ({resp.status}) {url}: {body}"
                         )
                         self._note_failure()
                         return "", 0.0

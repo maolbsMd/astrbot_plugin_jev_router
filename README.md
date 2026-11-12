@@ -113,6 +113,11 @@ git clone https://github.com/maolbsMd/astrbot_plugin_jev_router.git
 
 ## 📋 更新日志
 
+### 1.5.1
+
+- 修复 Gemini 后端填裸域名（如 `https://gateway.example`）时被拼成 `/decisions` 导致 404 的问题：现在自动补全为 `/v1beta/decisions`
+- 非 200 日志带上实际请求 URL，便于区分「路径错」和「认证/额度错」
+
 ### 1.5.0
 
 - 新增 `decision_backend`：可选 `jev`（TypeSafe SystemOne）或 `gemini`（Google Gemini Decision 1）
