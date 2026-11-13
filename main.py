@@ -44,7 +44,7 @@ _FAIL_COOLDOWN = 60.0         # 熔断秒数
 
 @register("astrbot_plugin_jev_router", "Amadeus & 相合伞",
           "多代理意图路由（放行式）：Jev / Gemini Decision 判定，仅覆写本轮模型/人设/工具，"
-          "主流程、会话历史与记忆注入归档全程与原生一致", "1.7.0")
+          "主流程、会话历史与记忆注入归档全程与原生一致", "1.7.1")
 class JevRouterPlugin(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
@@ -257,17 +257,72 @@ class JevRouterPlugin(Star):
             return None
         return next((a for a in self._get_agents() if a["name"] == agent_name), None)
 
+    def _wake_prefixes(self) -> list[str]:
+        try:
+            raw = self.context.get_config().get("wake_prefix", []) or []
+            if isinstance(raw, str):
+                raw = [raw]
+            return [str(p) for p in raw if str(p)]
+        except Exception:
+            return []
+
+    def _addressed_to_bot(self, event: AstrMessageEvent) -> bool | None:
+        """消息是否真的点名了 bot（@ / 引用 bot / 唤醒词）。
+
+        返回 None 表示平台事件结构不支持判断，交给调用方保守处理。
+        `is_wake` 会被其他插件/会话配置置为 True，不能单独作为依据。
+        """
+        comps = getattr(getattr(event, "message_obj", None), "message", None)
+        if not isinstance(comps, list) or not comps:
+            return None
+        try:
+            self_id = str(event.get_self_id() or "")
+        except Exception:
+            return None
+
+        for comp in comps:
+            name = type(comp).__name__
+            if name == "At" and str(getattr(comp, "qq", "")) == self_id:
+                return True
+            if name == "AtAll":
+                return True
+            if name == "Reply":
+                if str(getattr(comp, "sender_id", "")) == self_id:
+                    return True
+                chain = getattr(comp, "chain", None)
+                if isinstance(chain, list):
+                    for sub in chain:
+                        if type(sub).__name__ == "At" and str(getattr(sub, "qq", "")) == self_id:
+                            return True
+
+        # message_str 在唤醒阶段可能已被去掉前缀，这里优先用原始 Plain 文本
+        text = "".join(
+            str(getattr(c, "text", "") or "")
+            for c in comps
+            if type(c).__name__ == "Plain"
+        )
+        if not text:
+            text = event.message_str or ""
+        text = text.lstrip()
+        return any(text.startswith(p) for p in self._wake_prefixes())
+
     def _should_route(self, event: AstrMessageEvent) -> bool:
         """只判定真正需要 bot 回复的消息。
 
-        私聊：全部判定；群聊：只有 @bot / 引用 bot / 命中唤醒前缀的消息才判定。
+        私聊：全部判定；群聊：先要求 is_wake，再确认消息确实 @ / 引用 / 唤醒词点名了 bot。
         """
         try:
             if event.is_private_chat():
                 return True
             if not bool(self.config.get("only_wake_in_group", True)):
                 return True
-            return bool(getattr(event, "is_wake", False))
+            if not bool(getattr(event, "is_wake", False)):
+                return False
+            addressed = self._addressed_to_bot(event)
+            if addressed is False:
+                logger.debug("[JevRouter] 群聊消息 is_wake=True 但未点名 bot，跳过判定")
+                return False
+            return True
         except Exception:
             # 平台事件结构不认识时保守判定，避免漏答
             return True

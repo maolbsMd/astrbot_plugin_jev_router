@@ -117,6 +117,11 @@ git clone https://github.com/maolbsMd/astrbot_plugin_jev_router.git
 
 ## 📋 更新日志
 
+### 1.7.1
+
+- 修复群聊「每条消息都判定」：不再只信 `is_wake`（会被其他插件或会话配置置为 True），再校验消息链里是否真的 @bot / 引用 bot / 带唤醒词
+- 未点名 bot 的群消息会打一条 debug 日志后跳过，不调用判定接口
+
 ### 1.7.0
 
 - 多模态单文件上限从固定 4MB 改为可配 `media_max_mb`（默认 10MB，范围 1~20）
